@@ -1,8 +1,8 @@
 # ISLA BRASA 3D
 
-[![make.fun](https://make.fun/badge/gta6-01.svg)](https://make.fun/competitions/gta6-01)
-[![make.fun rank](https://make.fun/badge/gta6-01/rank.svg)](https://make.fun/competitions/gta6-01)
-[![make.fun reward](https://make.fun/badge/gta6-01/reward.svg)](https://make.fun/competitions/gta6-01)
+[![make.fun · gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![rank](https://make.fun/badge/gta6-01/awalsa/gta6-04/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
+[![reward](https://make.fun/badge/gta6-01/awalsa/gta6-04/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
 A 3D third-person GTA-style open-city game for the [make.fun gta6-01 bounty](https://make.fun/competitions/gta6-01) — a full rebuild of ISLA BRASA in Three.js (low-poly, no external model files). Walk the streets of Isla Brasa, steal cars, fight Delgado's crew, dodge the cops, and finish all **12 missions for $10,510**.
 
