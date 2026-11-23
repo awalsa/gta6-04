@@ -3,6 +3,33 @@
 // Built from the design spec only. Shared geometries/materials are reused
 // so draw calls stay sane; buildWorld() runs once (no per-frame work here).
 import * as THREE from 'three';
+import { SHOP_POSITIONS, INTERIORS, PROPERTIES, RUNWAY } from './config.js';
+
+// Worker G: enterable-interior door positions (from config INTERIORS) and
+// buyable-property marker positions (from config PROPERTIES).
+export function doorMarkers() {
+  return Object.values(INTERIORS).map((d) => ({ id: d.id, name: d.name, x: d.door.x, z: d.door.z }));
+}
+
+export function propertyMarkers() {
+  return Object.values(PROPERTIES).map((p) => ({ id: p.id, name: p.name, x: p.at.x, z: p.at.z, price: p.price, dailyIncome: p.dailyIncome }));
+}
+
+// ---- night-glow registry (Worker A) ---------------------------------------
+// Shared lamp-head + window materials are collected here at build time so
+// setNightGlow() can dim/brighten them at dusk/dawn; the sky dome material
+// is kept too so daynight.js can tint it dark at night.
+const nightLampMats = [];
+const nightWindowMats = [];
+let skyDomeMat = null;
+
+// ---- wet-ground registry (Worker E) ---------------------------------------
+// Ground + road materials captured at build time so setWetGround() can
+// darken them and drop their roughness when it rains.
+let wetGroundMat = null;
+let wetRoadMat = null;
+let wetGroundOrig = null;
+let wetRoadOrig = null;
 
 // ---------------------------------------------------------------------------
 // Fixed landmark coordinates — every worker uses these exact numbers.
@@ -27,10 +54,64 @@ export function landmarkPos(name) {
   return p ? { x: p.x, z: p.z } : null;
 }
 
+// Walkable sidewalk points for pedestrians: along each road line, offset
+// ~7.5u to the side (sidewalk band is 6..9u from the road centre), every
+// 20u, skipping water (x < -170, z > 170) and building colliders is left to
+// the pedestrian's own push-out. Returns [{x, z}, ...].
+export function sidewalkPoints(S) {
+  const pts = [];
+  for (const c of ROAD_LINES) {
+    for (let t = -160; t <= 160; t += 20) {
+      for (const off of [-7.5, 7.5]) {
+        pts.push({ x: c + off, z: t });
+        pts.push({ x: t, z: c + off });
+      }
+    }
+  }
+  const colliders = S?.world?.colliders || [];
+  return pts.filter((p) => {
+    if (p.x < -168 || p.x > 198 || p.z < -198 || p.z > 168) return false;
+    return !colliders.some((col) => col.minX !== undefined &&
+      p.x > col.minX - 1 && p.x < col.maxX + 1 && p.z > col.minZ - 1 && p.z < col.maxZ + 1);
+  });
+}
+
 // Roads run along these lines (both axes). Road half-width 6, sidewalk 9.
-const ROAD_LINES = [-160, -80, 0, 80, 160];
+export const ROAD_LINES = [-160, -80, 0, 80, 160];
 const ROAD_HALF = 6;
 const WALK_HALF = 9;
+
+// Boat moorings on the water (west strip x < -170, south strip z > 170) and
+// the motorbike parking spot by Brasa Garage.
+export const BOAT_SPAWNS = [
+  { x: -185, z: -150 }, // marina docks
+  { x: 30, z: 186 },    // beachfront south water
+  { x: -190, z: 60 },   // west water, clear of the pier deck
+];
+export const BIKE_SPAWN = { x: 72, z: -110 }; // by Brasa Garage (60,-120)
+
+/** Road graph for traffic.js: nodes at every road-line intersection, with
+ *  an adjacency list (same-row / same-column neighbours only, so every
+ *  segment runs straight along a road). Returns { nodes: [{x,z}], adjacent: [[idx]] }. */
+export function roadNetwork(S) {
+  const nodes = [];
+  const indexOf = new Map();
+  for (const x of ROAD_LINES) {
+    for (const z of ROAD_LINES) {
+      indexOf.set(`${x},${z}`, nodes.length);
+      nodes.push({ x, z });
+    }
+  }
+  const adjacent = nodes.map((n) => {
+    const out = [];
+    for (const [nx, nz] of [[n.x - 80, n.z], [n.x + 80, n.z], [n.x, n.z - 80], [n.x, n.z + 80]]) {
+      const j = indexOf.get(`${nx},${nz}`);
+      if (j !== undefined) out.push(j);
+    }
+    return out;
+  });
+  return { nodes, adjacent };
+}
 
 // Deterministic pseudo-random from two integers (stable layout, no Math.random).
 function hash2(a, b) {
@@ -86,6 +167,16 @@ export function buildWorld(scene) {
     pink: mat(0xd86a92),
     crate: mat(0xa67c3d),
   };
+  // Register the shared glow materials for the day/night cycle (Worker A):
+  // lamps blaze at night, windows light up; both stay dim in daylight.
+  if (!nightLampMats.includes(M.lampHead)) nightLampMats.push(M.lampHead);
+  if (!nightWindowMats.includes(M.window)) nightWindowMats.push(M.window);
+  // Wet-ground refs (Worker E): the base ground + asphalt materials.
+  wetGroundMat = M.grass; wetRoadMat = M.road;
+  wetGroundOrig = { color: M.grass.color.getHex(), roughness: M.grass.roughness };
+  wetRoadOrig = { color: M.road.color.getHex(), roughness: M.road.roughness };
+  M.lampHead.emissiveIntensity = 0.12; // day: lamps off
+  M.window.emissiveIntensity = 0.25;   // day: windows dim
   const buildingMats = [M.red, M.blue, M.teal, M.purple, M.orange, M.grey, M.pink, M.yellow];
   const carPaints = [M.red, M.blue, M.teal, M.yellow, M.purple, M.white, M.orange];
 
@@ -121,7 +212,8 @@ export function buildWorld(scene) {
       colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
     }
     skyGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    const sky = new THREE.Mesh(skyGeo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false }));
+    skyDomeMat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false });
+    const sky = new THREE.Mesh(skyGeo, skyDomeMat);
     scene.add(sky);
   }
   // Sun: bright sphere high in the sky.
@@ -379,6 +471,70 @@ export function buildWorld(scene) {
     }
   }
 
+  // ---- Brasa Airfield runway (Worker F) ----------------------------------
+  // Flat strip along the south road (z = 160, x -20..100, heading east —
+  // see config.js RUNWAY). Asphalt + centreline dashes + threshold bars +
+  // a windsock at the east end. No colliders on the strip itself: it is
+  // flat and clear by design (the nearest parked car sits 20u west of the
+  // threshold, palms/lamps stay at z = 168).
+  {
+    const R = RUNWAY || { x: 40, z: 160, length: 120, width: 12 };
+    addPlane(scene, M.dark, R.length, R.width, R.x, 0.07, R.z); // asphalt
+    // Centreline dashes along the strip.
+    for (let x = R.x - R.length / 2 + 6; x <= R.x + R.length / 2 - 6; x += 12) {
+      addPlane(scene, M.white, 6, 0.5, x, 0.08, R.z);
+    }
+    // Threshold bars at both ends.
+    for (const tx of [R.x - R.length / 2 + 3, R.x + R.length / 2 - 3]) {
+      addPlane(scene, M.white, 1, R.width - 2, tx, 0.08, R.z);
+    }
+    // Windsock: pole + orange cone at the east end, off the strip.
+    const ws = R.windsock || { x: R.x + 66, z: R.z - 10 };
+    const pole = new THREE.Mesh(cylGeo, M.grey);
+    pole.scale.set(0.18, 5, 0.18);
+    pole.position.set(ws.x, 2.5, ws.z);
+    scene.add(pole);
+    const sock = new THREE.Mesh(coneGeo, M.orange);
+    sock.scale.set(0.7, 2.2, 0.7);
+    sock.rotation.z = Math.PI / 2.4;
+    sock.position.set(ws.x + 0.9, 5.1, ws.z);
+    scene.add(sock);
+    addCollider(ws.x, ws.z, 0.3, 0.3);
+  }
+
+  // ---- shops (Worker E) --------------------------------------------------
+  // Enterable shop doors: Brasa Threads (clothes) at the plaza, Ammu-Nation
+  // (weapons) at the underpass. Glowing sign bands + awnings mark the doors;
+  // main.js opens the shop overlay with E when the player stands near one.
+  {
+    const shops = SHOP_POSITIONS || {
+      clothes: { x: 70, z: 92 }, weapons: { x: 112, z: 48 },
+    };
+    // Clothes shop: pink neon sign + striped awning, door faces the plaza.
+    addBox(scene, M.neonPink, 9, 1.4, 0.6, shops.clothes.x, 4.6, shops.clothes.z - 3);
+    addBox(scene, M.white, 9.4, 0.3, 2.4, shops.clothes.x, 3.4, shops.clothes.z - 2);
+    addBox(scene, M.dark, 3.4, 3, 0.4, shops.clothes.x, 1.5, shops.clothes.z - 3);
+    // Weapon shop: orange neon sign + dark storefront, door faces the road.
+    addBox(scene, M.neonOrange, 9, 1.4, 0.6, shops.weapons.x, 4.6, shops.weapons.z - 3);
+    addBox(scene, M.grey, 9.4, 0.3, 2.4, shops.weapons.x, 3.4, shops.weapons.z - 2);
+    addBox(scene, M.dark, 3.4, 3, 0.4, shops.weapons.x, 1.5, shops.weapons.z - 3);
+  }
+
+  // ---- Worker G: interior doors + property markers ------------------------
+  // Glowing door frames mark the three enterable interiors (E to enter):
+  // garage (60,-113), casino (120,-50), safehouse/motel (-60,144.5). Gold
+  // pillars mark the three buyable properties (P for the property menu).
+  for (const d of Object.values(INTERIORS)) {
+    addBox(scene, M.neonCyan, 3.6, 0.5, 0.4, d.door.x, 3.4, d.door.z);
+    addBox(scene, M.neonCyan, 0.4, 3.4, 0.4, d.door.x - 1.8, 1.7, d.door.z);
+    addBox(scene, M.neonCyan, 0.4, 3.4, 0.4, d.door.x + 1.8, 1.7, d.door.z);
+    addPlane(scene, M.neonCyan, 4, 1.6, d.door.x, 0.08, d.door.z + 1.2);
+  }
+  for (const p of Object.values(PROPERTIES)) {
+    addBox(scene, M.gold, 0.8, 3.2, 0.8, p.at.x + 6, 1.6, p.at.z + 6);
+    addBox(scene, M.window, 1.2, 0.5, 1.2, p.at.x + 6, 3.4, p.at.z + 6);
+  }
+
   // ---- props: street lamps -------------------------------------------------
   const lampAt = (x, z) => {
     const pole = new THREE.Mesh(cylGeo, M.dark);
@@ -464,9 +620,105 @@ export function buildWorld(scene) {
   return {
     landmarks,
     colliders,
+    shops: SHOP_POSITIONS || { clothes: { x: 70, z: 92 }, weapons: { x: 112, z: 48 } },
+    doors: doorMarkers(), // Worker G: enterable interior doors (E to enter)
+    properties: propertyMarkers(), // Worker G: buyable property markers
     spawnPoints: {
       player: { x: 10, z: 10 },
       cars: carSpawns,
+      bike: BIKE_SPAWN,
+      boats: BOAT_SPAWNS,
+      plane: (RUNWAY && RUNWAY.planeSpot) || { x: 20, z: 160, yaw: Math.PI / 2 },
     },
+    // Night-glow refs for daynight.js / main.js (Worker A).
+    lamps: nightLampMats,
+    windows: nightWindowMats,
+    skyMaterial: skyDomeMat,
   };
 }
+
+// Toggle the night glow: lamps blaze and building windows light up at
+// night, both dim back down in daylight. Safe to call before buildWorld
+// (no-op) and cheap enough to call on every dusk/dawn transition.
+export function setNightGlow(S, isNight) {
+  try {
+    for (const m of nightLampMats) {
+      if (m && m.emissive) m.emissiveIntensity = isNight ? 2.4 : 0.12;
+    }
+    for (const m of nightWindowMats) {
+      if (m && m.emissive) m.emissiveIntensity = isNight ? 1.6 : 0.25;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---- wet ground + rain field (Worker E) -----------------------------------
+// setWetGround(S, wet): rain makes the grass darker and the asphalt darker
+// and shinier (lower roughness = more reflective look); dry restores the
+// original colours. Safe to call before buildWorld (no-op).
+export function setWetGround(S, wet) {
+  try {
+    if (!wetGroundMat || !wetRoadMat || !wetGroundOrig || !wetRoadOrig) return false;
+    if (wet) {
+      wetGroundMat.color.setHex(0x3d5f33);
+      wetGroundMat.roughness = 0.55;
+      wetRoadMat.color.setHex(0x1a1a20);
+      wetRoadMat.roughness = 0.35;
+    } else {
+      wetGroundMat.color.setHex(wetGroundOrig.color);
+      wetGroundMat.roughness = wetGroundOrig.roughness;
+      wetRoadMat.color.setHex(wetRoadOrig.color);
+      wetRoadMat.roughness = wetRoadOrig.roughness;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// createRainField(scene): a cheap Points-based rain streak field (~600
+// points) around the origin; weather.js moves it with the camera and
+// recycles drops that hit the ground. Returns { points, update }.
+export function createRainField(scene) {
+  try {
+    const COUNT = 600;
+    const AREA = 60;
+    const HEIGHT = 28;
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(COUNT * 3);
+    for (let i = 0; i < COUNT; i++) {
+      pos[i * 3] = (Math.random() - 0.5) * AREA * 2;
+      pos[i * 3 + 1] = Math.random() * HEIGHT;
+      pos[i * 3 + 2] = (Math.random() - 0.5) * AREA * 2;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({ color: 0x9fc8ff, size: 0.18, transparent: true, opacity: 0.65 });
+    const points = new THREE.Points(geo, mat);
+    points.visible = false;
+    points.frustumCulled = false;
+    if (scene) scene.add(points);
+    return {
+      points,
+      update(cameraPos, dt) {
+        if (!cameraPos) return;
+        const arr = geo.attributes.position.array;
+        for (let i = 0; i < COUNT; i++) {
+          arr[i * 3 + 1] -= 26 * dt;
+          arr[i * 3] += 26 * 0.12 * dt;
+          if (arr[i * 3 + 1] < 0) {
+            arr[i * 3 + 1] = HEIGHT;
+            arr[i * 3] = cameraPos.x + (Math.random() - 0.5) * AREA * 2;
+            arr[i * 3 + 2] = cameraPos.z + (Math.random() - 0.5) * AREA * 2;
+          }
+        }
+        geo.attributes.position.needsUpdate = true;
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ISLA BRASA 3D — recorded agent authorship touch (2026-11-23)

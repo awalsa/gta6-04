@@ -12,11 +12,15 @@ export const WEAPONS = {
   smg:     { name: 'SMG',     dmg: 15, range: 25, rate: 8, auto: true },
   shotgun: { name: 'Shotgun', dmg: 60, range: 12, rate: 1, auto: false },
   rifle:   { name: 'Rifle',   dmg: 40, range: 60, rate: 2, auto: false },
+  // Worker E: Ammu-Nation exclusives (bought in the weapon shop).
+  sniper:  { name: 'Sniper Rifle', dmg: 120, range: 120, rate: 0.7, auto: false },
+  rpg:     { name: 'RPG',     dmg: 150, range: 50, rate: 0.5, auto: false },
 };
-export const WEAPON_ORDER = ['fists', 'pistol', 'smg', 'shotgun', 'rifle'];
+export const WEAPON_ORDER = ['fists', 'pistol', 'smg', 'shotgun', 'rifle', 'sniper', 'rpg'];
+export const EXTRA_WEAPON_IDS = ['sniper', 'rpg'];
 
 export function weaponStats(S, id) {
-  return S?.config?.WEAPONS?.[id] || WEAPONS[id] || WEAPONS.fists;
+  return S?.config?.WEAPONS?.[id] || S?.config?.EXTRA_WEAPONS?.[id] || WEAPONS[id] || WEAPONS.fists;
 }
 
 /** Select a weapon by id ('pistol') or 0-based index into WEAPON_ORDER.
@@ -27,6 +31,9 @@ export function selectWeapon(S, idOrIndex) {
   const id = typeof idOrIndex === 'number'
     ? WEAPON_ORDER[idOrIndex]
     : idOrIndex;
+  if (!id || !weaponStats(S, id)) return;
+  // Worker E: Ammu-Nation exclusives can only be selected once owned.
+  if (EXTRA_WEAPON_IDS.includes(id) && !(S.ownedWeapons || []).includes(id)) return;
   if (id && weaponStats(S, id)) p.weapon = id;
 }
 
@@ -100,6 +107,29 @@ export function createEnemy(scene, pos, kind = 'thug') {
   };
 }
 
+// ---------------------------------------------------------------- heist squad (Worker F)
+// Spawn the heist vault guards: `count` 'guard' enemies in a ring around
+// (x, z), flagged heist:true and pushed into S.enemies. missions.js calls
+// this (via main.js S.spawnHeistSquad) for the part-3 `clear` step of the
+// Brasa Heist; it falls back to plain createEnemy spawns when absent.
+export function spawnHeistSquad(S, x, z, count = 6) {
+  if (!S) return [];
+  S.enemies = S.enemies || [];
+  const squad = [];
+  const n = Math.max(1, Math.round(count) || 6);
+  for (let i = 0; i < n; i++) {
+    const angle = (i / n) * Math.PI * 2 + 0.6;
+    const r = 8 * (0.5 + 0.5 * ((i % 2) + 1) / 2);
+    const e = createEnemy(S.scene, { x: x + Math.cos(angle) * r, z: z + Math.sin(angle) * r }, 'guard');
+    if (!e) continue;
+    e.heist = true;
+    e.mission = true;
+    S.enemies.push(e);
+    squad.push(e);
+  }
+  return squad;
+}
+
 function bumpWanted(S, n) {
   if (typeof S?.addWanted === 'function') S.addWanted(n);
   else S.wanted = Math.max(0, Math.min(5, (S.wanted || 0) + n));
@@ -109,7 +139,8 @@ function bumpWanted(S, n) {
 function damageEnemy(S, enemy, dmg) {
   enemy.hp -= dmg;
   if (enemy.hp > 0) return;
-  // Kill: remove from scene + list, drop cash, raise wanted by 1 (cap 5).
+  // Kill: explosion burst + remove from scene + list, drop cash, raise wanted by 1 (cap 5).
+  if (S.particles?.spawnExplosion) S.particles.spawnExplosion(enemy.pos);
   if (enemy.mesh && S.scene) S.scene.remove(enemy.mesh);
   if (S.enemies) {
     const i = S.enemies.indexOf(enemy);
@@ -159,6 +190,7 @@ export function playerAttack(S) {
   const last = S._lastShotAt ?? -10;
   if (now - last < 1 / (w.rate || 2)) return;
   S._lastShotAt = now;
+  if (S?.audio?.playSfx) S.audio.playSfx(weaponId === 'fists' ? 'punch' : 'gunshot'); // Worker A audio
 
   if (weaponId === 'fists') {
     // Punch: nearest enemy within range in front of the player.
@@ -179,7 +211,8 @@ export function playerAttack(S) {
 
   // Hitscan shot toward the crosshair (camera forward).
   const { origin, dir } = aimRay(S);
-  const cone = weaponId === 'shotgun' ? 0.26 : 0.1; // radians of tolerance
+  // Worker E: sniper is pinpoint (tight cone), shotgun sprays, RPG explodes.
+  const cone = weaponId === 'shotgun' ? 0.26 : weaponId === 'sniper' ? 0.02 : 0.1; // radians of tolerance
   let best = null, bestT = w.range;
   for (const e of S.enemies || []) {
     const to = new THREE.Vector3(e.pos.x - origin.x, 0, e.pos.z - origin.z);
@@ -193,7 +226,18 @@ export function playerAttack(S) {
   const end = best
     ? new THREE.Vector3(best.pos.x, best.pos.y + 1.2, best.pos.z)
     : origin.clone().addScaledVector(dir, w.range);
-  spawnTracer(S, origin, end);
+  spawnTracer(S, origin, end, weaponId === 'rpg' ? 0xff7a1a : weaponId === 'sniper' ? 0xff66ff : 0xffe066);
+  if (S.particles?.spawnMuzzle) S.particles.spawnMuzzle(origin, dir);
+  if (typeof S.pedestriansFleeFrom === 'function') S.pedestriansFleeFrom(origin);
+  // Worker E: RPG explodes on impact — every enemy within 6u of the blast
+  // takes full damage, even if the rocket itself missed.
+  if (weaponId === 'rpg') {
+    if (S.particles?.spawnExplosion) S.particles.spawnExplosion(end);
+    for (const e of [...(S.enemies || [])]) {
+      if (Math.hypot(e.pos.x - end.x, e.pos.z - end.z) <= 6) damageEnemy(S, e, w.dmg);
+    }
+    return;
+  }
   if (best) damageEnemy(S, best, w.dmg);
 }
 
@@ -304,3 +348,5 @@ export function updateCombat(S, dt) {
     }
   }
 }
+
+// ISLA BRASA 3D — recorded agent authorship touch (2026-11-23)

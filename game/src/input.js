@@ -25,6 +25,25 @@ export const input = {
   pressed(code) { return this._justPressed.has(code); },
   released(code) { return this._justReleased.has(code); },
 
+  // Worker C: true if ANY key went down this frame or the mouse was
+  // clicked — the dialogue box is skippable with any key or click.
+  anyPressed() { return this._justPressed.size > 0 || this.mouse.clicked; },
+
+  // Worker C: side-job starter keys. Returns 'taxi' (T), 'delivery' (Y),
+  // or null. main.js calls this once per frame from handleOverlayKeys.
+  sideJobPressed() {
+    if (this.pressed('KeyT')) return 'taxi';
+    if (this.pressed('KeyY')) return 'delivery';
+    return null;
+  },
+
+  // Worker E: R switches radio station while driving (race start on foot),
+  // V toggles the weather, E opens a shop near its door. main.js reads
+  // these once per frame from handleOverlayKeys.
+  radioPressed() { return this.pressed('KeyR'); },
+  weatherTogglePressed() { return this.pressed('KeyV'); },
+  shopInteractPressed() { return this.pressed('KeyE'); },
+
   // WASD / action conveniences (accepts KeyboardEvent.code values).
   get moveForward() { return this.down('KeyW') || this.down('ArrowUp'); },
   get moveBack() { return this.down('KeyS') || this.down('ArrowDown'); },
@@ -32,6 +51,8 @@ export const input = {
   get moveRight() { return this.down('KeyD') || this.down('ArrowRight'); },
   get run() { return this.down('ShiftLeft') || this.down('ShiftRight'); },
   get jump() { return this.pressed('Space'); },
+  // M toggles audio mute (Worker A); the map moved to N (see main.js).
+  get toggleMute() { return this.pressed('KeyM'); },
 
   // --- per-frame bookkeeping (called by main.js) ---------------------------
   // IMPORTANT: call update() at the END of the frame, after all consumers

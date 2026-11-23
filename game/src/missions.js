@@ -10,13 +10,26 @@
 // The same tolerance applies to reading the player: player.x/z, or
 // player.position (THREE.Vector3), or player.mesh.position all work.
 
-import { LANDMARKS, MISSIONS, RACES, RESPECT_RANKS, RESPECT_PAYOUT_BONUS_PER_RANK } from './config.js';
-import { respectRank } from './economy.js';
+import { LANDMARKS, MISSIONS, HEIST, HEIST_TOTAL_PAYOUT, HEIST_PART3_TIME, RACES, RESPECT_RANKS, RESPECT_PAYOUT_BONUS_PER_RANK, DIALOGUE } from './config.js';
+import { respectRank, awardHeistPayout } from './economy.js';
+
+// ------------------------------------------------------------ dialogue hooks (Worker C)
+// Intro on mission start, one completion line on mission complete.
+// Never blocks gameplay: uses S.showDialogue when main.js wired it,
+// otherwise a best-effort dynamic import; any failure is swallowed.
+function showMissionDialogue(S, speaker, lines, onDone) {
+  try {
+    if (typeof S.showDialogue === 'function') { S.showDialogue(speaker, lines, onDone); return; }
+    import('./dialogue.js')
+      .then((m) => { if (m && typeof m.showDialogue === 'function') m.showDialogue(S, speaker, lines, onDone); })
+      .catch(() => { /* dialogue unavailable — mission still runs */ });
+  } catch (e) { /* never break a mission for dialogue */ }
+}
 
 export const GOTO_RADIUS = 6; // goto / deliver complete within 6 units
 const PICKUP_SPREAD = 6;      // collect pickups scattered around the landmark
 const ENEMY_SPREAD = 8;       // clear enemies scattered around the landmark
-const STEAL_CAR_TYPES = { 10: 'cometa', 12: 'cometa' }; // fast car for those jobs
+const STEAL_CAR_TYPES = { 10: 'cometa', 12: 'cometa', 13: 'cometa' }; // fast car for those jobs (13 = heist getaway)
 
 // ------------------------------------------------------------ position utils
 export function posOf(obj) {
@@ -55,6 +68,7 @@ function ensureState(S) {
   if (typeof S.cash !== 'number') S.cash = 0;
   if (typeof S.respect !== 'number') S.respect = 0;
   if (typeof S.wanted !== 'number') S.wanted = 0;
+  if (!S.heistPartsPaid || typeof S.heistPartsPaid !== 'object') S.heistPartsPaid = {};
 }
 
 export function saveProgress(S) {
@@ -72,7 +86,56 @@ export function saveProgress(S) {
 
 // ------------------------------------------------------------ mission lookup
 export function missionDef(id) {
+  if (id === HEIST.id) return HEIST;
   return MISSIONS.find((m) => m.id === id) || null;
+}
+
+// ------------------------------------------------------------ the heist (Worker F)
+// The Brasa Heist (mission 13): 3 parts, $5,000 total — part 1 $250, part 2
+// $250, part 3 $4,500. Unlocks once all 12 main missions are done OR the
+// player has hired at least 1 crew member. Part 3 runs on its own 240 s
+// clock (starts when the vault job begins, not at heist start).
+export function heistAvailable(S) {
+  ensureState(S);
+  if (S.heistDone || S.missionsDone.includes(HEIST.id)) return false;
+  if (S.mission) return false;
+  const allMissionsDone = MISSIONS.every((m) => S.missionsDone.includes(m.id));
+  const crewHired = S.crew && Object.values(S.crew).some((c) => c && c.hired);
+  return allMissionsDone || !!crewHired;
+}
+
+/** Current heist part (1-3) while the heist is active, else null. */
+export function heistPart(S) {
+  if (!S.mission || S.mission.id !== HEIST.id) return null;
+  const step = currentStep(S);
+  if (step && typeof step.part === 'number') return step.part;
+  const steps = S.mission.def.steps || [];
+  const last = steps[Math.min(S.mission.stepIndex, steps.length - 1)];
+  return (last && typeof last.part === 'number') ? last.part : 1;
+}
+
+export function startHeist(S) {
+  ensureState(S);
+  if (S.heistDone || S.missionsDone.includes(HEIST.id)) return { ok: false, error: 'heist already completed' };
+  if (S.mission) return { ok: false, error: 'a mission is already active' };
+  if (!heistAvailable(S)) return { ok: false, error: 'heist locked — finish all 12 missions or hire a crew member first' };
+
+  S.mission = {
+    id: HEIST.id, def: HEIST, stepIndex: 0,
+    timeLeft: null, timeLimit: null, // part 3 starts its own 240 s clock
+    stepPickups: [], stepEnemies: [], stepCar: null, ally: null, getawayCar: null,
+    heist: true, _heatAt: 0,
+  };
+
+  // Crew effects: Marta fights beside you in the vault job; Rico's getaway
+  // bonus (+20% top speed in missions) applies via economy.carStats.
+  if (S.crew && S.crew.marta && S.crew.marta.hired) spawnMartaAlly(S);
+
+  setupStep(S);
+  S.overlay = null;
+  const intro = DIALOGUE[HEIST.id];
+  if (intro) showMissionDialogue(S, intro.speaker, intro.lines);
+  return { ok: true, mission: S.mission };
 }
 
 /** Next uncompleted mission id (missions auto-unlock in order), or null. */
@@ -156,6 +219,29 @@ function jitter(center, spread, i, n) {
   return { x: center.x + Math.cos(angle) * r, z: center.z + Math.sin(angle) * r };
 }
 
+// Worker F: push a point out of any building collider (with a 2u margin)
+// so a collect pickup never lands somewhere the player cannot stand —
+// pickups jittered around the casino centre (18x18 collider) were
+// uncollectible by walking, which also blocked the heist's vault cases.
+function clearOfColliders(S, x, z) {
+  const cols = S?.world?.colliders || [];
+  let px = x, pz = z;
+  for (const c of cols) {
+    if (c.minX === undefined || c.maxX === undefined) continue;
+    const m = 2;
+    if (px > c.minX - m && px < c.maxX + m && pz > c.minZ - m && pz < c.maxZ + m) {
+      const dl = px - (c.minX - m), dr = (c.maxX + m) - px;
+      const dt = pz - (c.minZ - m), db = (c.maxZ + m) - pz;
+      const min = Math.min(dl, dr, dt, db);
+      if (min === dl) px = c.minX - m;
+      else if (min === dr) px = c.maxX + m;
+      else if (min === dt) pz = c.minZ - m;
+      else pz = c.maxZ + m;
+    }
+  }
+  return { x: px, z: pz };
+}
+
 // ------------------------------------------------------------ beacons/markers
 function setMarker(S, target) {
   // S.markers is the shared contract the world worker renders as a glowing
@@ -190,14 +276,25 @@ function setupStep(S) {
     const n = step.count || 1;
     for (let i = 0; i < n; i++) {
       const p = jitter(lm, PICKUP_SPREAD, i, n);
-      S.mission.stepPickups.push(spawnPickup(S, p.x, p.z));
+      const clear = clearOfColliders(S, p.x, p.z);
+      S.mission.stepPickups.push(spawnPickup(S, clear.x, clear.z));
     }
   } else if (step.kind === 'clear') {
     // Fresh wave every time — a second `clear` step spawns a new wave.
     const n = step.count || 1;
-    for (let i = 0; i < n; i++) {
-      const p = jitter(lm, ENEMY_SPREAD, i, n);
-      S.mission.stepEnemies.push(spawnEnemy(S, p.x, p.z));
+    // Heist vault job: a proper guard squad via combat.js (main.js wires
+    // S.spawnHeistSquad); falls back to plain thug spawns when absent.
+    let squad = null;
+    if (S.mission.id === HEIST.id && typeof S.spawnHeistSquad === 'function') {
+      try { squad = S.spawnHeistSquad(lm.x, lm.z, n) || null; } catch { squad = null; }
+    }
+    if (squad && squad.length) {
+      S.mission.stepEnemies.push(...squad);
+    } else {
+      for (let i = 0; i < n; i++) {
+        const p = jitter(lm, ENEMY_SPREAD, i, n);
+        S.mission.stepEnemies.push(spawnEnemy(S, p.x, p.z));
+      }
     }
   } else if (step.kind === 'steal') {
     const typeId = STEAL_CAR_TYPES[S.mission.id] || 'brasa';
@@ -297,16 +394,37 @@ export function startMission(S, id) {
 
   setupStep(S);
   S.overlay = null;
+  const intro = DIALOGUE[id];
+  if (intro) showMissionDialogue(S, intro.speaker, intro.lines);
   return { ok: true, mission: S.mission };
 }
 
 function advanceStep(S) {
+  const finished = currentStep(S);
+  const prevPart = finished ? finished.part : null;
   S.mission.stepIndex += 1;
   if (S.mission.stepIndex >= S.mission.def.steps.length) {
     completeMission(S);
-  } else {
-    setupStep(S);
+    return;
   }
+  // Heist part boundary: pay the finished part, and start the part-3 clock
+  // when the vault job begins (Ghost adds +15s/level, applied once here).
+  if (S.mission.id === HEIST.id && prevPart != null) {
+    const nextStep = S.mission.def.steps[S.mission.stepIndex];
+    if (nextStep && nextStep.part !== prevPart) {
+      const partDef = HEIST.parts.find((p) => p.part === prevPart);
+      if (partDef) {
+        const r = awardHeistPayout(S, prevPart, partDef.payout);
+        if (r.ok) S.mission.lastPartPayout = { part: prevPart, amount: partDef.payout };
+      }
+      if (nextStep.part === 3) {
+        const timeLeft = HEIST_PART3_TIME + 15 * ghostLevel(S);
+        S.mission.timeLeft = timeLeft;
+        S.mission.timeLimit = timeLeft;
+      }
+    }
+  }
+  setupStep(S);
 }
 
 function stepDone(S) {
@@ -362,6 +480,29 @@ export function updateMission(S, dt) {
     return;
   }
 
+  // Pickup sparkle: a mission pickup newly taken since last frame glints.
+  S._sparkledPickups = S._sparkledPickups || new Set();
+  for (const pk of m.stepPickups || []) {
+    if (pickupTaken(S, pk) && !S._sparkledPickups.has(pk)) {
+      S._sparkledPickups.add(pk);
+      if (S.particles?.spawnSparkle) S.particles.spawnSparkle(pk.pos || { x: pk.x, z: pk.z });
+    }
+  }
+
+  // Heist escape: wanted climbs while running the loot to the Beachfront
+  // (police.js raiseHeistHeat via main.js S.heistHeat, S.addWanted fallback).
+  if (m.id === HEIST.id) {
+    const step = currentStep(S);
+    if (step && step.part === 3 && step.kind === 'deliver') {
+      const now = S.time || 0;
+      if (now - (m._heatAt || 0) >= 8) {
+        m._heatAt = now;
+        if (typeof S.heistHeat === 'function') S.heistHeat(1);
+        else if (typeof S.addWanted === 'function') S.addWanted(1);
+      }
+    }
+  }
+
   if (stepDone(S)) {
     const finished = currentStep(S);
     if (finished && finished.kind === 'steal') {
@@ -371,6 +512,18 @@ export function updateMission(S, dt) {
     clearStepSpawns(S);
     advanceStep(S);
   }
+  missionPickupChime(S); // Worker A audio: chime on each collected pickup
+}
+
+// Pickup chime hook (Worker A audio): call once per frame from updateMission;
+// plays when a new mission pickup has been taken since the last frame.
+function missionPickupChime(S) {
+  if (!S || !S.mission) return;
+  const takenNow = (S.mission.stepPickups || []).filter((p) => pickupTaken(S, p)).length;
+  if (takenNow > (S.mission._takenCount || 0)) {
+    S.mission._takenCount = takenNow;
+    if (S.audio) S.audio.playSfx('pickup');
+  }
 }
 
 export function completeMission(S) {
@@ -378,10 +531,23 @@ export function completeMission(S) {
   ensureState(S);
   const m = S.mission;
   const rank = respectRank(S);
-  const bonus = 1 + RESPECT_PAYOUT_BONUS_PER_RANK * rank.index;
-  const payout = Math.round(m.def.payout * bonus);
-  S.cash = (S.cash || 0) + payout;
-  S.respect = (S.respect || 0) + Math.round(m.def.payout / 10);
+  let payout;
+  if (m.id === HEIST.id) {
+    // Heist: the total is exactly $5,000 — parts 1+2 already paid on their
+    // part boundaries, so part 3 pays the remainder ($4,500 on a clean run).
+    const paid = Object.values(S.heistPartsPaid || {}).reduce((a, b) => a + (b || 0), 0);
+    payout = Math.max(0, HEIST_TOTAL_PAYOUT - paid);
+    if (payout > 0) {
+      const r = awardHeistPayout(S, 3, payout);
+      payout = r.ok ? r.amount : 0;
+    }
+    S.heistDone = true;
+  } else {
+    const bonus = 1 + RESPECT_PAYOUT_BONUS_PER_RANK * rank.index;
+    payout = Math.round(m.def.payout * bonus);
+    S.cash = (S.cash || 0) + payout;
+    S.respect = (S.respect || 0) + Math.round(m.def.payout / 10);
+  }
   if (!S.missionsDone.includes(m.id)) S.missionsDone.push(m.id);
   S.missionsDone.sort((a, b) => a - b);
 
@@ -392,6 +558,9 @@ export function completeMission(S) {
   const doneName = m.def.name;
   S.mission = null;
   S.lastMissionResult = { ok: true, id: doneId, name: doneName, payout, rank: rank.name };
+  const outro = DIALOGUE[doneId];
+  if (outro && outro.done) showMissionDialogue(S, outro.done.speaker || outro.speaker, outro.done.lines);
+  if (S.audio) S.audio.playSfx('mission-complete'); // Worker A audio
   saveProgress(S);
   return { ok: true, id: doneId, name: doneName, payout, rank: rank.name };
 }
@@ -470,3 +639,5 @@ export function updateRace(S, dt) {
     setMarker(S, r.checkpoint);
   }
 }
+
+// ISLA BRASA 3D — recorded agent authorship touch (2026-11-23)

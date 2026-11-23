@@ -62,16 +62,19 @@ export const LANDMARKS = {
   market: { x: -120, z: -80, name: 'Feria Market' },
   pier: { x: -180, z: 120, name: 'Old Pier' },
   marina: { x: -160, z: -160, name: 'Marina Docks' },
-  garage: { x: 60, z: -120, name: 'Brasa Garage' },
+  garage: { x: 60, z: -113, name: 'Brasa Garage' },
   arcade: { x: 0, z: 0, name: 'Rook Arcade' },
-  casino: { x: 120, z: -60, name: 'Coral Room Casino' },
+  casino: { x: 120, z: -50, name: 'Coral Room Casino' },
   tunnel: { x: 150, z: 100, name: 'Coast Tunnel' },
   motel: { x: -60, z: 140, name: 'Motel Vela' },
   underpass: { x: 100, z: 40, name: 'Underpass' },
-  church: { x: -40, z: -140, name: 'Old Church' },
+  church: { x: -40, z: -132, name: 'Old Church' },
   plaza: { x: 80, z: 80, name: 'Plaza Tower' },
   beach: { x: 0, z: 180, name: 'Beachfront' },
 };
+// NOTE: keep in sync with config.js LANDMARKS (gameplay target = entrance,
+// not building centre). This copy only feeds the fallback world builder;
+// the live world comes from world.js LANDMARK_POSITIONS (building centres).
 
 const CITY = 200; // half-size; city spans [-200, 200] on x and z.
 
@@ -111,7 +114,7 @@ async function tryImport(path) {
 }
 
 async function loadOptionalModules() {
-  const [world, player, cars, combat, police, missions, hud, config, economy] = await Promise.all([
+  const [world, player, cars, combat, police, missions, hud, config, economy, pedestrians, particles, dialogue, sidejobs, audio, daynight, traffic, radio, weather, casino, properties, interiors, plane] = await Promise.all([
     tryImport('./world.js'),
     tryImport('./player.js'),
     tryImport('./cars.js'),
@@ -121,9 +124,30 @@ async function loadOptionalModules() {
     tryImport('./hud.js'),
     tryImport('./config.js'),
     tryImport('./economy.js'),
+    tryImport('./pedestrians.js'),
+    tryImport('./particles.js'),
+    tryImport('./dialogue.js'),
+    tryImport('./sidejobs.js'),
+    tryImport('./audio.js'),
+    tryImport('./daynight.js'),
+    tryImport('./traffic.js'),
+    tryImport('./radio.js'),
+    tryImport('./weather.js'),
+    tryImport('./casino.js'),
+    tryImport('./properties.js'),
+    tryImport('./interiors.js'),
+    tryImport('./plane.js'),
   ]);
-  return { world, player, cars, combat, police, missions, hud, config, economy };
+  return { world, player, cars, combat, police, missions, hud, config, economy, pedestrians, particles, dialogue, sidejobs, audio, daynight, traffic, radio, weather, casino, properties, interiors, plane };
 }
+
+// Silent stand-in for S.audio when audio.js is absent (Worker A): every
+// call is a no-op so SFX hooks in the sibling modules never throw.
+const noopAudio = {
+  initAudio() {}, setMuted() {}, isMuted() { return false; },
+  toggleMuted() { return false; }, playSfx() {}, startMusic() {},
+  stopMusic() {}, setEngineLevel() {}, setSiren() {},
+};
 
 // ---------------------------------------------------------------------------
 // Fallback world (used only if world.js is absent). Low-poly city: ground,
@@ -304,12 +328,21 @@ async function boot() {
   camera.position.set(0, 8, 18);
 
   scene.add(new THREE.HemisphereLight(0xbfd9ff, 0x4a5a3a, 0.95));
+  const hemiLight = scene.children[scene.children.length - 1];
   const sun = new THREE.DirectionalLight(0xfff2cc, 1.1);
   sun.position.set(120, 180, 60);
   scene.add(sun);
   const sunMesh = new THREE.Mesh(new THREE.SphereGeometry(8, 12, 10),
     new THREE.MeshBasicMaterial({ color: 0xfff6c0, fog: false }));
   sunMesh.position.set(180, 140, -120); scene.add(sunMesh);
+  // Moon light + mesh (Worker A day/night): intensity 0 by day, the
+  // daynight module orbits both lights and moves both meshes.
+  const moonLight = new THREE.DirectionalLight(0x8fa8ff, 0);
+  moonLight.position.set(-120, 120, -60);
+  scene.add(moonLight);
+  const moonMesh = new THREE.Mesh(new THREE.SphereGeometry(6, 12, 10),
+    new THREE.MeshBasicMaterial({ color: 0xdfe8ff, fog: false }));
+  moonMesh.position.set(-180, 140, 120); scene.add(moonMesh);
   const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
   for (const [cx, cy, cz] of [[-80, 55, -100], [60, 62, 80], [120, 50, -40], [-40, 58, 140]]) {
     const c = new THREE.Mesh(new THREE.SphereGeometry(9, 8, 6), cloudMat);
@@ -324,12 +357,31 @@ async function boot() {
     cash: save.cash ?? 500, respect: save.respect ?? 0, wanted: 0,
     crew: save.crew || defaultSave().crew,
     ownedCars: save.ownedCars || ['vela'],
+    ownedVehicles: save.ownedVehicles || [], // owned bike ('bike') / boat ('boat') — Worker D
+    traffic: null, // traffic.js owns this (createTraffic below)
     upgrades: save.upgrades || {},
     weapon: save.weapon || 'fists',
     ownedWeapons: save.ownedWeapons || ['fists'],
     ammo: save.ammo || {},
+    outfits: [...(save.outfits || ['street'])], // Worker E: owned outfit ids
+    equippedOutfit: save.equippedOutfit || 'street', // Worker E: worn outfit
     race: null, racesWon: [...(save.racesWon || [])],
+    plane: null, // Worker F: flyable plane (plane.js) on the airfield runway
+    heistDone: !!(save.heistDone || (save.missionsDone || []).includes(13)), // Worker F: heist completion from save
+    heistPartsPaid: save.heistPartsPaid || {}, // Worker F: part payouts from save (no double-pay)
+    orbsCollected: [...(save.orbsCollected || [])],
+    sideJobsDone: save.sideJobsDone || { taxi: 0, delivery: 0, orbs: 0, earned: 0 },
+    sideJobs: null, // sidejobs.js owns this (createSideJobs below)
+    dialogue: null, // dialogue.js owns this (showDialogue below)
+    properties: [...(save.properties || [])], // Worker G: owned property ids
+    casino: null, // Worker G: casino game state (casino.js owns the shape)
+    insideInterior: null, // Worker G: 'garage' | 'casino' | 'safehouse' | null
+    interiorBounds: null, // Worker G: room clamp set by interiors.js
+    dayCount: 0, // Worker G: in-game days elapsed (income pays per rollover)
+    lastIncome: null, // Worker G: { amount, at, day } of the last daily payout
+    interiors: null, // Worker G: built rooms from interiors.js
     markers: [], time: 0, input,
+    timeOfDay: 0.30, isNight: false, // Worker A day/night: 0.30 = 07:12
     world: { landmarks: LANDMARKS, colliders: [] },
     paused: false,
     overlay: null, // hud/economy-owned: null | 'garage' | 'shop'
@@ -350,6 +402,27 @@ async function boot() {
   window.ISLA_BRASA = S; // debug / headless verification handle
   window.__THREE__ = THREE;
 
+  // --- Worker A: audio manager + day/night cycle ---------------------------
+  // Lights for daynight.js (sun/moon orbit + sky/fog lerp).
+  S.sunLight = sun; S.moonLight = moonLight;
+  S.sunMesh = sunMesh; S.moonMesh = moonMesh; S.hemiLight = hemiLight;
+  S.audio = (mods.audio && mods.audio.createAudioManager)
+    ? mods.audio.createAudioManager() : noopAudio;
+  S.dayNight = (mods.daynight && mods.daynight.createDayNight)
+    ? mods.daynight.createDayNight(S) : null;
+
+  // --- Worker E: radio + weather -------------------------------------------
+  // Both are optional: if either module failed to load, the game still runs
+  // (radio silent, weather stays clear). createRadio/createWeather never
+  // throw — a failure just leaves the feature off.
+  try { S.radio = (mods.radio && mods.radio.createRadio) ? mods.radio.createRadio(S) : null; }
+  catch (err) { console.warn('[main] createRadio failed:', err); S.radio = null; }
+  try { S.weather = (mods.weather && mods.weather.createWeather) ? mods.weather.createWeather(S) : null; }
+  catch (err) { console.warn('[main] createWeather failed:', err); S.weather = null; }
+  S.weatherKind = 'clear';
+  // Hook economy.buyOutfit uses to recolour the player after a purchase.
+  S.applyOutfit = (S2) => (mods.player?.applyOutfit ? mods.player.applyOutfit(S2 || S) : false);
+
   // --- world ---------------------------------------------------------------
   if (mods.world?.buildWorld) {
     try {
@@ -357,6 +430,17 @@ async function boot() {
       if (w && w.landmarks) S.world.landmarks = w.landmarks;
       if (w && w.colliders) S.world.colliders = w.colliders;
       if (w && w.spawnPoints) S.world.spawnPoints = w.spawnPoints;
+      if (w && w.shops) S.world.shops = w.shops;
+      if (w && w.doors) S.world.doors = w.doors; // Worker G: interior doors
+      if (w && w.properties) S.world.propertyMarkers = w.properties; // Worker G: property markers
+      // Worker A day/night: sky dome material (tinted dark at night) and
+      // the lamp/window material refs for setNightGlow().
+      if (w && w.skyMaterial) S.world.skyMaterial = w.skyMaterial;
+      if (w && w.lamps) S.world.lamps = w.lamps;
+      if (w && w.windows) S.world.windows = w.windows;
+      // Worker E: rain field + wet-ground helpers live on the world module.
+      if (mods.world.createRainField) S.world.createRainField = mods.world.createRainField;
+      if (mods.world.setWetGround) S.world.setWetGround = mods.world.setWetGround;
     } catch (err) {
       console.warn('[main] buildWorld failed, using fallback world:', err);
       S.world = fallbackBuildWorld(scene);
@@ -368,6 +452,21 @@ async function boot() {
   if (!S.world.colliders) S.world.colliders = [];
   const spawnPos = S.world.spawnPoints?.player || { x: 10, z: 10 };
 
+  // --- Worker G: enterable interiors (garage / casino / safehouse) --------
+  // Rooms are built once into the scene; enter/exit swaps colliders and
+  // teleports the player (interiors.js). All optional — a failure here
+  // must not break the boot.
+  try { S.interiors = (mods.interiors && mods.interiors.buildInteriors) ? mods.interiors.buildInteriors(S) : null; }
+  catch (err) { console.warn('[main] buildInteriors failed:', err); S.interiors = null; }
+  S.teleportPlayer = (x, y, z) => (mods.player?.teleportPlayer ? mods.player.teleportPlayer(S, x, y, z) : false);
+  S.openCasino = () => (mods.casino?.openCasino ? mods.casino.openCasino(S)
+    : (mods.economy?.openCasino ? mods.economy.openCasino(S) : (S.overlay = 'casino')));
+  S.openProperties = () => (mods.properties?.openProperties ? mods.properties.openProperties(S)
+    : (mods.economy?.openProperties ? mods.economy.openProperties(S) : (S.overlay = 'properties')));
+  S.enterInterior = (id) => (mods.interiors?.enterInterior ? mods.interiors.enterInterior(S, id) : { ok: false, error: 'interiors not available' });
+  S.exitInterior = () => (mods.interiors?.exitInterior ? mods.interiors.exitInterior(S) : { ok: false, error: 'interiors not available' });
+  S.sleepInSafehouse = () => (mods.interiors?.sleepInSafehouse ? mods.interiors.sleepInSafehouse(S) : { ok: false, error: 'interiors not available' });
+
   // --- player --------------------------------------------------------------
   if (mods.player?.createPlayer) {
     try { S.player = mods.player.createPlayer(scene, spawnPos); }
@@ -375,10 +474,34 @@ async function boot() {
   } else {
     S.player = fallbackCreatePlayer(scene, spawnPos);
   }
+  // Worker E: dress the player in the saved outfit (default 'street').
+  try { if (mods.player?.applyOutfit) mods.player.applyOutfit(S); } catch (err) { console.warn('[main] applyOutfit failed:', err); }
 
   // --- cars ----------------------------------------------------------------
   if (mods.cars?.spawnParkedCars) {
     try { mods.cars.spawnParkedCars(S); } catch (err) { console.warn('[main] spawnParkedCars failed:', err); }
+  }
+  // --- Worker D: free motorbike by the garage + boats on the water ---------
+  if (mods.cars?.spawnWorldVehicles) {
+    try { mods.cars.spawnWorldVehicles(S); } catch (err) { console.warn('[main] spawnWorldVehicles failed:', err); }
+  }
+  // --- Worker F: flyable plane on the Brasa Airfield runway ---------------
+  if (mods.plane?.createPlane) {
+    try {
+      const spot = S.world?.spawnPoints?.plane || S.config?.RUNWAY?.planeSpot || { x: 20, z: 160, yaw: Math.PI / 2 };
+      S.plane = mods.plane.createPlane(scene, spot);
+    } catch (err) { console.warn('[main] createPlane failed:', err); S.plane = null; }
+  }
+  // Worker F hooks: plane enter/exit (player.js E), heist guard squads
+  // (missions.js clear step), heist escape heat (missions.js, police.js).
+  S.enterPlane = () => (mods.plane?.enterPlane ? mods.plane.enterPlane(S) : { ok: false, error: 'plane not available' });
+  S.exitPlane = () => (mods.plane?.exitPlane ? mods.plane.exitPlane(S) : { ok: false, error: 'plane not available' });
+  S.spawnHeistSquad = (x, z, n) => (mods.combat?.spawnHeistSquad ? mods.combat.spawnHeistSquad(S, x, z, n) : null);
+  S.heistHeat = (n) => (mods.police?.raiseHeistHeat ? mods.police.raiseHeistHeat(S, n) : S.addWanted(n));
+  // --- Worker D: ambient traffic (8 cars on the road grid) -----------------
+  if (mods.traffic?.createTraffic) {
+    try { S.traffic = mods.traffic.createTraffic(S, S.config?.TRAFFIC?.count ?? 8); }
+    catch (err) { console.warn('[main] createTraffic failed:', err); }
   }
   if (S.cars.length === 0) {
     S.cars = [
@@ -387,6 +510,14 @@ async function boot() {
       fallbackCreateCar(scene, 60, -108, 0xf39c12, 'sport'),
       fallbackCreateCar(scene, 120, -48, 0x8e44ad, 'muscle'),
     ];
+  }
+
+  // --- particles + pedestrians (Worker B; optional, game survives without them) ---
+  if (mods.particles?.createParticles) {
+    try { mods.particles.createParticles(S); } catch (err) { console.warn('[main] createParticles failed:', err); }
+  }
+  if (mods.pedestrians?.createPedestrians) {
+    try { mods.pedestrians.createPedestrians(S, S.config?.PEDESTRIAN_COUNT ?? 16); } catch (err) { console.warn('[main] createPedestrians failed:', err); }
   }
 
   // --- spawn hooks (missions.js calls these; the hook MUST push the created
@@ -419,12 +550,28 @@ async function boot() {
     S.cars.push(c);
     return c;
   };
+  // Worker D: spawn a bought bike/boat in the world if none exists yet
+  // (economy.buyCar calls this so a purchase is immediately drivable).
+  S.spawnVehicle = (typeId) => {
+    if (S.cars.some((v) => v && v.vehicleKind === typeId)) return S.cars.find((v) => v.vehicleKind === typeId);
+    if (typeId === 'bike' && mods.cars?.createBike) {
+      const b = mods.cars.createBike(scene, S.world?.spawnPoints?.bike || { x: 72, z: -110 });
+      if (b) { S.cars.push(b); return b; }
+    }
+    if (typeId === 'boat' && mods.cars?.createBoat) {
+      const spot = (S.world?.spawnPoints?.boats || [{ x: -185, z: -150 }])[0];
+      const b = mods.cars.createBoat(scene, spot);
+      if (b) { S.cars.push(b); return b; }
+    }
+    return null;
+  };
   // Pickups are collected by walking over them (within 2.2 units) or via F
   // (player.js calls S.onPickup for the nearest pickup). No sibling module
   // collects them, so main.js owns this.
   S.onPickup = (pk) => {
     if (!pk || pk.taken) return;
     pk.taken = true;
+    if (S.particles?.spawnSparkle) S.particles.spawnSparkle(pk.pos || { x: pk.x, z: pk.z });
     if (pk.mesh && scene) scene.remove(pk.mesh);
   };
 
@@ -446,6 +593,9 @@ async function boot() {
   const updateCars = mods.cars?.updateCar
     ? (dt) => { for (const car of [...S.cars]) mods.cars.updateCar(S, car, dt); }
     : (dt) => fallbackUpdateCars(S, dt);
+  const updateTraffic = mods.traffic?.updateTraffic
+    ? (dt) => mods.traffic.updateTraffic(S, dt)
+    : () => {};
   const updateCombat = mods.combat?.updateCombat
     ? (dt) => mods.combat.updateCombat(S, dt)
     : () => {};
@@ -458,6 +608,21 @@ async function boot() {
   const updateRace = mods.missions?.updateRace
     ? (dt) => mods.missions.updateRace(S, dt)
     : () => {};
+  const updatePlane = mods.plane?.updatePlane
+    ? (dt) => mods.plane.updatePlane(S, dt)
+    : () => {};
+  const updatePedestrians = mods.pedestrians?.updatePedestrians
+    ? (dt) => mods.pedestrians.updatePedestrians(S, dt)
+    : () => {};
+  const updateParticles = mods.particles?.updateParticles
+    ? (dt) => mods.particles.updateParticles(S, dt)
+    : () => {};
+  const updateSideJobs = mods.sidejobs?.updateSideJobs
+    ? (dt) => mods.sidejobs.updateSideJobs(S, dt)
+    : () => {};
+  const updateDialogue = mods.dialogue?.updateDialogue
+    ? (dt) => mods.dialogue.updateDialogue(S, dt)
+    : () => {};
   const updateHUD = mods.hud?.updateHUD
     ? () => mods.hud.updateHUD(S)
     : () => { fallbackUpdateHUD(S); drawMinimap(S); };
@@ -466,6 +631,12 @@ async function boot() {
     if (mods.missions?.startMission) return mods.missions.startMission(S, id);
     return fallbackStartMission(S, id);
   };
+  // Worker F: The Brasa Heist (mission 13, 3 parts, $5,000) — unlocked by
+  // finishing all 12 missions or hiring a crew member; auto-starts below.
+  S.startHeist = () => {
+    if (mods.missions?.startHeist) return mods.missions.startHeist(S);
+    return { ok: false, error: 'heist not available' };
+  };
   S.startRace = (id) => {
     if (mods.missions?.startRace) return mods.missions.startRace(S, id);
     return { ok: false, error: 'races not available' };
@@ -473,9 +644,40 @@ async function boot() {
   S.MISSIONS = mods.config?.MISSIONS || FALLBACK_MISSIONS;
   S.RACES = mods.config?.RACES || [];
 
+  // --- dialogue + side jobs (Worker C) -------------------------------------
+  // Both are optional: if either module failed to load, the game still runs
+  // (missions.js falls back to a dynamic import for dialogue; side jobs
+  // simply stay unavailable).
+  S.showDialogue = (speaker, lines, onDone) => {
+    if (mods.dialogue?.showDialogue) return mods.dialogue.showDialogue(S, speaker, lines, onDone);
+    if (typeof onDone === 'function') { try { onDone(); } catch (e) { /* ignore */ } }
+    return null;
+  };
+  S.skipDialogue = () => (mods.dialogue?.skipDialogue ? mods.dialogue.skipDialogue(S) : false);
+  S.awardSideJob = (kind, amount) => {
+    if (mods.economy?.awardSideJob) return mods.economy.awardSideJob(S, kind, amount);
+    S.cash = (S.cash || 0) + amount;
+    return { ok: true, kind, amount, cash: S.cash };
+  };
+  S.startTaxi = () => (mods.sidejobs?.startTaxi ? mods.sidejobs.startTaxi(S) : { ok: false, error: 'side jobs not available' });
+  S.startDelivery = () => (mods.sidejobs?.startDelivery ? mods.sidejobs.startDelivery(S) : { ok: false, error: 'side jobs not available' });
+  if (mods.sidejobs?.createSideJobs) {
+    try { mods.sidejobs.createSideJobs(S); } catch (err) { console.warn('[main] createSideJobs failed:', err); }
+  }
+
   // --- input / overlays ------------------------------------------------------
   input.attach(window);
   wireOverlays(S, mods);
+
+  // Worker A audio: WebAudio needs a user gesture — init + start the music
+  // on the first pointer/key press, then never again.
+  const unlockAudio = () => {
+    try { S.audio.initAudio(); S.audio.startMusic(); } catch { /* silent */ }
+    window.removeEventListener('pointerdown', unlockAudio);
+    window.removeEventListener('keydown', unlockAudio);
+  };
+  window.addEventListener('pointerdown', unlockAudio);
+  window.addEventListener('keydown', unlockAudio);
 
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -506,10 +708,51 @@ async function boot() {
       S.time += dt;
       updatePlayer(dt);
       updateCars(dt);
+      updatePlane(dt); // Worker F: flyable plane (no-op when not flying)
+      updateTraffic(dt); // Worker D: ambient traffic AI (road graph + yield)
       updateCombat(dt);
       updatePolice(dt);
       updateMissions(dt);
       updateRace(dt);
+      updatePedestrians(dt);
+      updateParticles(dt);
+      updateSideJobs(dt);
+      // Worker G: interior upkeep (camera distance while inside).
+      if (mods.interiors?.updateInterior) {
+        try { mods.interiors.updateInterior(S, dt); } catch (err) { console.warn('[main] updateInterior failed:', err); }
+      }
+      // Worker E: radio plays only while driving (updateRadio checks that
+      // itself); weather rolls rain in/out and animates the rain field.
+      if (S.radio) { try { S.radio.updateRadio(S, dt); } catch (err) { console.warn('[main] updateRadio failed:', err); } }
+      if (S.weather) { try { S.weather.updateWeather(S, dt); } catch (err) { console.warn('[main] updateWeather failed:', err); } }
+      // Worker A day/night: advance the clock; on dusk/dawn flip the lamps
+      // and windows via world.setNightGlow(). Time never gates missions.
+      if (S.dayNight) {
+        const wasNight = S.isNight; // daynight.update() sets S.isNight itself
+        const dn = S.dayNight.update(dt);
+        if (dn && dn.isNight !== wasNight) {
+          S.isNight = dn.isNight;
+          if (mods.world && mods.world.setNightGlow) {
+            try { mods.world.setNightGlow(S, S.isNight); } catch (err) { console.warn('[main] setNightGlow failed:', err); }
+          }
+        }
+        // Worker G: day rollover — timeOfDay wrapping past midnight pays
+        // one day of property income into S.cash (properties.js).
+        if (typeof S.timeOfDay === 'number') {
+          if (S._prevTimeOfDay != null && S.timeOfDay < S._prevTimeOfDay - 0.5) {
+            S.dayCount = (S.dayCount || 0) + 1;
+            if (mods.properties?.collectDailyIncome) {
+              try { mods.properties.collectDailyIncome(S); } catch (err) { console.warn('[main] collectDailyIncome failed:', err); }
+            }
+          }
+          S._prevTimeOfDay = S.timeOfDay;
+        }
+      }
+      // Worker A audio: engine hum follows the driven car's speed; the
+      // police siren loops while any wanted stars are up.
+      const pc = S.player && S.player.car;
+      S.audio.setEngineLevel(pc ? Math.min(1, Math.abs(pc.speed || 0) / ((pc.stats && pc.stats.topSpeed) || 30)) : 0);
+      S.audio.setSiren((S.wanted || 0) > 0);
       collectNearbyPickups(S);
       // Auto-start the next mission when none is active (missions.js has
       // no auto-start; the HUD just says "Next: …"). Wait 2 s after a
@@ -523,11 +766,21 @@ async function boot() {
         if (S.time - failAt > 2) {
           const next = mods.missions.nextMissionId(S);
           if (next != null) S.startMission(next);
+          // Worker F: once the 12 missions are done (or a crew member is
+          // hired), the Brasa Heist auto-starts the same way.
+          else if (mods.missions.heistAvailable && mods.missions.heistAvailable(S)) S.startHeist();
         }
       }
       updateCamera(S, dt);
       updateBeacon(S, mods);
+    } else {
+      // Paused (overlay open): silence the engine hum + siren.
+      S.audio.setEngineLevel(0);
+      S.audio.setSiren(false);
     }
+    // Dialogue typewriter keeps advancing even while paused (overlays open),
+    // so a mission intro never freezes mid-sentence behind the garage/shop.
+    updateDialogue(dt);
     // combat.js sets only player.weapon; the HUD reads S.weapon.
     if (S.player && typeof S.player.weapon === 'string') S.weapon = S.player.weapon;
     S.camYaw = S.cameraYaw;
@@ -726,12 +979,17 @@ function updateCamera(S, dt) {
     const pos = playerPos(S);
     return pos ? new THREE.Vector3(pos.x, (pos.y || 0) + 1.6, pos.z) : new THREE.Vector3(0, 2, 0);
   })();
-  const dist = playerInCar(S) ? S.camDist + 2 : S.camDist;
+  // Worker G: inside an interior the camera stays close (4.5u) so it never
+  // leaves the room; the anti-clip pull-in below is skipped while inside.
+  const insideInterior = !!S.insideInterior;
+  // Worker F: pull the camera back while driving OR flying the plane.
+  const inPlane = !!(S.player && S.player.plane);
+  const dist = insideInterior ? 4.5 : ((playerInCar(S) || inPlane) ? S.camDist + 2 : S.camDist);
   const cp = Math.cos(S.camPitch), sp = Math.sin(S.camPitch);
   let cx = target.x + Math.sin(S.cameraYaw) * cp * dist;
   let cz = target.z + Math.cos(S.cameraYaw) * cp * dist;
   let cy = target.y + sp * dist;
-  for (const c of S.world.colliders) {
+  if (!insideInterior) for (const c of S.world.colliders) {
     if (cx > c.minX && cx < c.maxX && cz > c.minZ && cz < c.maxZ && cy < 24) {
       // Pull in close and high instead of clipping through the building.
       cx = target.x + Math.sin(S.cameraYaw) * 3;
@@ -919,7 +1177,51 @@ function renderShop(S) {
   });
 }
 
+// Worker E: nearest shop door within 7 units of the player, or null.
+// Shop positions come from config.SHOP_POSITIONS (clothes at the plaza,
+// weapons at the underpass); the fallback matches those coordinates.
+function nearestShop(S) {
+  const pos = playerPos(S);
+  if (!pos) return null;
+  const shops = (S.config && S.config.SHOP_POSITIONS) || (S.world && S.world.shops) || {
+    clothes: { x: 70, z: 92 },
+    weapons: { x: 112, z: 48 },
+  };
+  let best = null, bestD = 7;
+  for (const [kind, shop] of Object.entries(shops)) {
+    const d = Math.hypot(pos.x - shop.x, pos.z - shop.z);
+    if (d < bestD) { bestD = d; best = { kind, ...shop, dist: d }; }
+  }
+  return best;
+}
+
+function nearestCarWithin(S, maxDist) {
+  const pos = playerPos(S);
+  if (!pos) return false;
+  for (const car of S.cars || []) {
+    const cp = objPos(car);
+    if (!cp) continue;
+    if (Math.hypot(cp.x - pos.x, cp.z - pos.z) < maxDist) return true;
+  }
+  return false;
+}
+
 function handleOverlayKeys(S, mods) {
+  // Dialogue skip (Worker C): while a dialogue box is open, ANY key or
+  // click just skips it — no other overlay key fires on that press.
+  if (S.dialogue && S.dialogue.open) {
+    if (typeof input.anyPressed === 'function' ? input.anyPressed() : (input.mouse.clicked || false)) {
+      if (typeof S.skipDialogue === 'function') S.skipDialogue();
+      else if (mods.dialogue?.skipDialogue) mods.dialogue.skipDialogue(S);
+    }
+    return;
+  }
+  // Side-job keys (Worker C): T = taxi fare, Y = courier delivery.
+  if (typeof input.sideJobPressed === 'function') {
+    const sj = input.sideJobPressed();
+    if (sj === 'taxi' && typeof S.startTaxi === 'function') S.startTaxi();
+    else if (sj === 'delivery' && typeof S.startDelivery === 'function') S.startDelivery();
+  }
   if (input.pressed('KeyG')) {
     if (mods.economy) {
       if (S.overlay === 'garage') mods.economy.openShop(S);
@@ -933,13 +1235,77 @@ function handleOverlayKeys(S, mods) {
       renderShop(S);
     }
   }
-  if (input.pressed('KeyM')) {
+  if (input.toggleMute) { // M: mute toggle (Worker A audio)
+    S.audio.toggleMuted();
+    S.audio.playSfx('click');
+  }
+  if (input.pressed('KeyN')) { // N: map (moved from M so M can be mute)
     if (S.overlayOpen === 'map') closeMainOverlays(); else openMainOverlay(S, 'map');
   }
-  if (input.pressed('KeyR') && !S.race && S.startRace) {
-    for (const race of S.RACES || []) {
-      const r = S.startRace(race.id);
-      if (r && r.ok) break;
+  // Worker E: R switches the radio station WHILE DRIVING; on foot it still
+  // starts a race (race-start only on foot, radio only in a car).
+  if (typeof input.radioPressed === 'function' ? input.radioPressed() : input.pressed('KeyR')) {
+    if (playerInCar(S)) {
+      if (S.radio && typeof S.radio.nextStation === 'function') S.radio.nextStation();
+    } else if (!S.race && S.startRace) {
+      for (const race of S.RACES || []) {
+        const r = S.startRace(race.id);
+        if (r && r.ok) break;
+      }
+    }
+  }
+  // Worker E: V toggles the weather (clear <-> rain) for testing.
+  if (typeof input.weatherTogglePressed === 'function' ? input.weatherTogglePressed() : input.pressed('KeyV')) {
+    if (S.weather && typeof S.weather.setWeather === 'function') {
+      S.weather.setWeather(S, S.weather.isRaining() ? 'clear' : 'rain');
+    }
+  }
+  // Worker G: P opens the property menu (M is mute, N is map — P is free).
+  // Toggle: P again while the menu is open closes it.
+  if (input.pressed('KeyP') && !playerInCar(S)) {
+    if (S.overlay === 'properties') { S.overlay = null; }
+    else if (!S.overlay) {
+      if (S.overlayOpen) closeMainOverlays();
+      if (mods.properties?.openProperties) mods.properties.openProperties(S);
+      else if (mods.economy?.openProperties) mods.economy.openProperties(S);
+      else S.overlay = 'properties';
+    }
+  }
+  // Worker E: E near a shop door opens that shop (clothes at the plaza,
+  // weapons at the underpass). Skipped when a car is nearby — E then means
+  // enter/exit car (player.js owns that). Opening the overlay pauses the
+  // game, so updatePlayer never sees this same E press.
+  // Worker G: E is checked against interior doors FIRST — E at a glowing
+  // door enters the building (casino door also opens the casino overlay);
+  // E while inside an interior exits back to the door.
+  if ((typeof input.shopInteractPressed === 'function' ? input.shopInteractPressed() : input.pressed('KeyE'))
+      && !S.overlay && !playerInCar(S)) {
+    if (S.insideInterior) {
+      if (mods.interiors?.exitInterior) mods.interiors.exitInterior(S);
+    } else {
+      const door = mods.interiors?.nearestDoor ? mods.interiors.nearestDoor(S) : null;
+      if (door && !nearestCarWithin(S, 4)) {
+        if (S.overlayOpen) closeMainOverlays();
+        const entered = mods.interiors.enterInterior(S, door.id);
+        if (entered && entered.ok && door.id === 'casino') {
+          if (mods.casino?.openCasino) mods.casino.openCasino(S);
+          else if (mods.economy?.openCasino) mods.economy.openCasino(S);
+          else S.overlay = 'casino';
+        }
+      } else {
+        const shop = nearestShop(S);
+        if (shop && !nearestCarWithin(S, 4)) {
+          // A mission brief may still be up — dismiss it so the shop can open.
+          if (S.overlayOpen) closeMainOverlays();
+          if (shop.kind === 'clothes') {
+            if (mods.economy?.openClothesShop) mods.economy.openClothesShop(S);
+            else S.overlay = 'clothes';
+          } else {
+            if (mods.economy?.openWeaponShop) mods.economy.openWeaponShop(S);
+            else S.overlay = 'weapons';
+          }
+        }
+      }
     }
   }
   if (input.pressed('Escape')) {

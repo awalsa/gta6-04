@@ -5,6 +5,7 @@
 // Shared contract: Y-up, ground XZ. Arcade landmark (0,0) is the respawn point.
 import * as THREE from 'three';
 import { playerAttack } from './combat.js';
+import { CLOTHES } from './config.js';
 
 export const WALK_SPEED = 6; // u/s
 export const RUN_SPEED = 10; // u/s
@@ -158,10 +159,54 @@ export function createPlayer(scene, pos) {
     grounded: true,
     walkPhase: 0,
     radius: PLAYER_RADIUS,
-    parts: { body, head, armL, armR, legL, legR },
+    parts: { body, head, hair: hairMesh, armL, armR, legL, legR },
   };
   group.rotation.y = player.yaw;
   return player;
+}
+
+// Worker E: recolour the player model to the equipped outfit
+// (S.equippedOutfit, e.g. 'vice' / 'racer' / 'boss'). Called by main.js at
+// boot and by economy.buyOutfit after a purchase/equip. Never throws.
+export function applyOutfit(S) {
+  try {
+    const p = S && S.player;
+    if (!p || !p.parts) return false;
+    const table = (S && S.config && S.config.CLOTHES) || CLOTHES;
+    const outfit = table[S.equippedOutfit] || table.street;
+    if (!outfit) return false;
+    const set = (mesh, hex) => {
+      if (mesh && mesh.material && mesh.material.color && typeof hex === 'number') mesh.material.color.setHex(hex);
+    };
+    set(p.parts.body, outfit.shirt);
+    set(p.parts.legL, outfit.pants);
+    set(p.parts.legR, outfit.pants);
+    set(p.parts.head, outfit.skin);
+    set(p.parts.hair, outfit.hair);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Worker G: teleport the player (used by interiors.js enter/exit).
+ *  Sets pos + mesh position + yaw, and the camera target next frame. */
+export function teleportPlayer(S, x, y, z) {
+  const p = S?.player;
+  if (!p || !p.pos) return false;
+  p.pos.set(x, y || 0, z);
+  p.vy = 0;
+  p.grounded = true;
+  if (p.mesh) { p.mesh.position.copy(p.pos); p.mesh.visible = true; }
+  return true;
+}
+
+export function enterInteriorPlayer(S, roomX, roomZ) {
+  return teleportPlayer(S, roomX, 0, roomZ + 2);
+}
+
+export function exitInteriorPlayer(S, x, z) {
+  return teleportPlayer(S, x, 0, z);
 }
 
 /** Camera yaw (radians) the player moves relative to.
@@ -178,6 +223,9 @@ export function getCameraYaw(S) {
   return 0;
 }
 
+/** Nearest enterable vehicle (car, motorbike, boat, traffic car) in S.cars
+ *  within maxDist of pos. Bikes and boats live in S.cars too, so E works
+ *  the same for every vehicle kind. */
 function nearestCar(S, pos, maxDist) {
   let best = null, bestD = maxDist;
   for (const car of S.cars || []) {
@@ -188,6 +236,18 @@ function nearestCar(S, pos, maxDist) {
   return best;
 }
 
+/** Where the player lands when stepping out of a vehicle. Cars and bikes:
+ *  to the side of the vehicle. Boats: the nearest shoreline — the player
+ *  cannot stand on water, so a boat exit puts them back on dry land. */
+function exitSpotFor(car) {
+  if (car && car.vehicleKind === 'boat') {
+    if (car.pos.x < -170) return { x: -168, z: THREE.MathUtils.clamp(car.pos.z, -198, 198) };
+    return { x: THREE.MathUtils.clamp(car.pos.x, -198, 198), z: 168 };
+  }
+  const side = new THREE.Vector3(Math.cos(car.yaw), 0, -Math.sin(car.yaw));
+  return { x: car.pos.x + side.x * 2.2, z: car.pos.z + side.z * 2.2 };
+}
+
 function respawn(S, p) {
   const a = arcadePos(S);
   p.pos.set(a.x, 0, a.z);
@@ -195,6 +255,8 @@ function respawn(S, p) {
   p.vy = 0;
   p.grounded = true;
   p.car = null;
+  // Worker F: stepping out of a wrecked flight too — clear the plane seat.
+  if (p.plane) { p.plane.driver = null; p.plane = null; }
   if (S.cash !== undefined) S.cash = Math.floor(S.cash / 2); // forgiving: lose half cash
   S.wanted = 0;
   S._policeReset = true; // police.js clears its spawns on next update
@@ -209,29 +271,48 @@ export function updatePlayer(S, dt) {
 
   if (S._respawnGrace > 0) S._respawnGrace -= dt;
 
+  // Hurt thud when HP drops (Worker A audio).
+  if (p.hp < (S._prevHp ?? p.hp)) { if (S.audio) S.audio.playSfx('hurt'); }
+  S._prevHp = p.hp;
+
   // --- death / respawn (checked even while driving) ---
   if (p.hp <= 0) {
     if (p.car) { p.car.driver = null; p.car = null; }
     respawn(S, p);
   }
 
-  // --- E: enter / exit nearest car (edge-triggered) ---
+  // --- E: enter / exit nearest vehicle (edge-triggered) ---
+  // Works for cars, motorbikes and boats alike: all three live in S.cars
+  // and share the same p.car seat. Exiting a boat steps ashore (see
+  // exitSpotFor); exiting a car/bike steps out to the side.
+  // Worker F: the plane is a separate vehicle (S.plane, p.plane) — E near
+  // it enters it (main.js wires S.enterPlane/S.exitPlane to plane.js),
+  // and E while flying exits it (only on the ground; exitPlane enforces it).
   if (keyPressed(S, 'KeyE')) {
-    if (p.car) {
+    if (p.plane) {
+      if (typeof S.exitPlane === 'function') S.exitPlane(S);
+      else { p.plane.driver = null; p.plane = null; if (p.mesh) p.mesh.visible = true; }
+    } else if (p.car) {
       const car = p.car;
       car.driver = null;
       p.car = null;
-      // Step out to the side of the car.
-      const side = new THREE.Vector3(Math.cos(car.yaw), 0, -Math.sin(car.yaw));
-      p.pos.set(car.pos.x + side.x * 2.2, 0, car.pos.z + side.z * 2.2);
+      const spot = exitSpotFor(car);
+      p.pos.set(spot.x, 0, spot.z);
       p.yaw = car.yaw;
       if (p.mesh) p.mesh.visible = true;
     } else {
-      const car = nearestCar(S, p.pos, 3);
-      if (car) {
-        p.car = car;
-        car.driver = p;
-        if (p.mesh) p.mesh.visible = false; // hidden while driving
+      const plane = S.plane;
+      if (plane && (plane.hp ?? 100) > 0
+          && Math.hypot(plane.pos.x - p.pos.x, plane.pos.z - p.pos.z) < 4) {
+        if (typeof S.enterPlane === 'function') S.enterPlane(S);
+        else { p.plane = plane; plane.driver = p; if (p.mesh) p.mesh.visible = false; }
+      } else {
+        const car = nearestCar(S, p.pos, 3);
+        if (car) {
+          p.car = car;
+          car.driver = p;
+          if (p.mesh) p.mesh.visible = false; // hidden while driving
+        }
       }
     }
   }
@@ -240,6 +321,18 @@ export function updatePlayer(S, dt) {
   if (p.car) {
     p.pos.copy(p.car.pos);
     p.yaw = p.car.yaw;
+    if (p.mesh) p.mesh.position.copy(p.pos);
+    if (S) {
+      S.cameraTarget = S.cameraTarget || new THREE.Vector3();
+      S.cameraTarget.set(p.pos.x, p.pos.y + 2, p.pos.z);
+    }
+    return;
+  }
+
+  // --- while flying, the plane module owns movement; just track the camera ---
+  if (p.plane) {
+    p.pos.copy(p.plane.pos);
+    p.yaw = p.plane.yaw;
     if (p.mesh) p.mesh.position.copy(p.pos);
     if (S) {
       S.cameraTarget = S.cameraTarget || new THREE.Vector3();
@@ -299,6 +392,12 @@ export function updatePlayer(S, dt) {
     p.speed = 0;
   }
 
+  // Sprinting into a crowd scatters pedestrians (throttled).
+  if (running && moving && (S.time - (S._pedFleeAt || 0)) > 0.5) {
+    S._pedFleeAt = S.time;
+    if (typeof S.pedestriansFleeFrom === 'function') S.pedestriansFleeFrom(p.pos, S.config?.PEDESTRIAN_SPRINT_FLEE_RADIUS ?? 3);
+  }
+
   // --- Space: small hop ---
   if (keyPressed(S, 'Space') && p.grounded) {
     p.vy = 7;
@@ -311,6 +410,13 @@ export function updatePlayer(S, dt) {
   }
 
   // --- AABB push-out vs world colliders + soft world bounds ---
+  // Worker G: inside an interior the wall colliders were swapped in by
+  // interiors.js, and the room bounds clamp keeps the player in the room.
+  if (S.insideInterior && S.interiorBounds) {
+    const b = S.interiorBounds;
+    p.pos.x = Math.max(b.minX, Math.min(b.maxX, p.pos.x));
+    p.pos.z = Math.max(b.minZ, Math.min(b.maxZ, p.pos.z));
+  }
   resolveColliders(p.pos, p.radius, S.world?.colliders);
   p.pos.x = Math.max(-230, Math.min(230, p.pos.x));
   p.pos.z = Math.max(-230, Math.min(230, p.pos.z));
@@ -318,6 +424,14 @@ export function updatePlayer(S, dt) {
   // --- limb-swing walk animation ---
   const targetPhaseRate = moving ? speed * 1.7 : 0;
   p.walkPhase += targetPhaseRate * dt;
+  // Footsteps, throttled by gait (Worker A audio).
+  if (moving) {
+    const stepGap = running ? 0.30 : 0.42;
+    if ((S.time || 0) - (S._lastStepAt ?? -9) > stepGap) {
+      S._lastStepAt = S.time || 0;
+      if (S.audio) S.audio.playSfx('footstep');
+    }
+  }
   const swing = moving ? 0.65 : 0;
   const s = Math.sin(p.walkPhase);
   const L = p.parts;
@@ -339,3 +453,5 @@ export function updatePlayer(S, dt) {
     S.cameraTarget.set(p.pos.x, p.pos.y + 1.6, p.pos.z);
   }
 }
+
+// ISLA BRASA 3D — recorded agent authorship touch (2026-11-23)

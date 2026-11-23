@@ -23,6 +23,15 @@ export function setWanted(S, n) {
   return S.wanted;
 }
 
+// ---------------------------------------------------------------- heist heat (Worker F)
+// The Brasa Heist escape: wanted climbs while the player runs the loot to
+// the Beachfront. missions.js calls this (via main.js S.heistHeat) on a
+// timer during the part-3 escape step. Same cap (5) and decay reset as a
+// normal crime — it is just addWanted under a heist name.
+export function raiseHeistHeat(S, n = 1) {
+  return addWanted(S, n);
+}
+
 // ---------------------------------------------------------------- helicopter
 function buildHeli(scene) {
   const group = new THREE.Group();
@@ -209,6 +218,11 @@ export function updatePolice(S, dt) {
     const boost = S.wanted >= 4 ? 1.15 : 1;
     moveCar(S, car, dt, dist > 6 ? 1 : 0.4, 0);
     car.speed = Math.min(car.speed, (car.stats?.topSpeed ?? 32) * boost);
+    // A police chase passing nearby scatters pedestrians (throttled).
+    if ((S.time - (S._policeFleeAt || 0)) > 0.5) {
+      S._policeFleeAt = S.time;
+      if (typeof S.pedestriansFleeFrom === 'function') S.pedestriansFleeFrom(car.pos, 15);
+    }
     // Ram: shove the player / their car and hurt an on-foot player.
     if (dist < 3.2) {
       const nx = dx / dist, nz = dz / dist;
